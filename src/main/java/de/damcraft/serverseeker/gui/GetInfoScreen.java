@@ -16,6 +16,7 @@ import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.multiplayer.MultiplayerScreen;
 import net.minecraft.client.gui.screen.multiplayer.MultiplayerServerListWidget;
 import net.minecraft.client.network.ServerInfo;
+import net.minecraft.util.Util;
 
 import java.net.InetAddress;
 import java.net.UnknownHostException;
@@ -30,6 +31,8 @@ import static meteordevelopment.meteorclient.MeteorClient.mc;
 
 public class GetInfoScreen extends WindowScreen {
     private final MultiplayerServerListWidget.Entry entry;
+    private long latency = -1;
+    private String serverVersion = "Unknown";
 
     public GetInfoScreen(MultiplayerScreen multiplayerScreen, MultiplayerServerListWidget.Entry entry) {
         super(GuiThemes.get(), "Get players");
@@ -39,37 +42,54 @@ public class GetInfoScreen extends WindowScreen {
 
     @Override
     public void initWidgets() {
-        // Get info about the server
         if (entry == null || !(entry instanceof MultiplayerServerListWidget.ServerEntry)) {
             add(theme.label("No server selected"));
             return;
         }
-        ServerInfo serverInfo = ((MultiplayerServerListWidget.ServerEntry) entry).getServer();
-        String address = serverInfo.address;
 
-        // Check if the server matches the regex for ip(:port)
-        if (!address.matches("^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}(?::[0-9]{1,5})?$")) {
-            try {
-                InetAddress inetAddress = InetAddress.getByName(address);
-                address = inetAddress.getHostAddress();
-            } catch (UnknownHostException e) {
-                add(theme.label("You can only get player info for servers with an IP address"));
-                return;
-            }
+        ServerInfo serverInfo = ((MultiplayerServerListWidget.ServerEntry) entry).getServer();
+        String address = resolveIp(serverInfo.address);
+        if (address == null) {
+            add(theme.label("Invalid or unsupported address."));
+            return;
         }
 
+        pingServer(serverInfo);
         add(theme.label("Loading..."));
+        fetchServerInfo(address);
+    }
 
-        String[] addressParts = address.split(":");
-        String ip = addressParts[0];
-        int port = addressParts.length > 1 ? Integer.parseInt(addressParts[1]) : 25565;
+    private String resolveIp(String address) {
+        if (address.matches("^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}(?::[0-9]{1,5})?$")) return address;
 
-        // Get the players using the API
-        /* {
-          "api_key": "...", // Your api_key
-          "ip": "109.123.240.84", // The ip of the server
-          "port": 25565  // The port of the server (defaults to 25565)
-        } */
+        try {
+            InetAddress inetAddress = InetAddress.getByName(address);
+            return inetAddress.getHostAddress();
+        } catch (UnknownHostException e) {
+            return null;
+        }
+    }
+
+    private void pingServer(ServerInfo serverInfo) {
+        serverInfo.pinged = false;
+        mc.getCurrentServerEntry().label = serverInfo.label;
+        mc.getCurrentServerEntry().address = serverInfo.address;
+        mc.getCurrentServerEntry().icon = serverInfo.getIcon();
+        mc.getCurrentServerEntry().ping = -2;
+
+        new Thread(() -> {
+            try {
+                mc.getServerList().ping(mc.getCurrentServerEntry());
+                latency = mc.getCurrentServerEntry().ping;
+            } catch (Exception ignored) {}
+        }).start();
+    }
+
+    private void fetchServerInfo(String address) {
+        String[] parts = address.split(":");
+        String ip = parts[0];
+        int port = parts.length > 1 ? Integer.parseInt(parts[1]) : 25565;
+
         ServerInfoRequest request = new ServerInfoRequest(ServerSeeker.API_KEY, ip, port);
 
         MeteorExecutor.execute(() -> {
@@ -80,99 +100,108 @@ public class GetInfoScreen extends WindowScreen {
 
             MinecraftClient.getInstance().execute(() -> {
                 clear();
-
                 if (response == null) {
                     add(theme.label("Network error")).expandX();
                     return;
                 }
 
-                // Set error message if there is one
                 if (response.isError()) {
                     add(theme.label(response.error())).expandX();
                     return;
                 }
 
-                load(response);
+                if (latency != -1) {
+                    add(theme.label("Server latency: " + latency + " ms")).expandX();
+                }
+
+                serverVersion = response.version() != null ? response.version() : "Unknown";
+                fetchServerLocation(ip);
+                loadPlayers(response);
             });
         });
     }
 
-    private void load(ServerInfoResponse response) {
+    private void fetchServerLocation(String ip) {
+        MeteorExecutor.execute(() -> {
+            String locationUrl = "http://ip-api.com/json/" + ip;
+            String locationResponse = Http.get(locationUrl).sendString();
+
+            MinecraftClient.getInstance().execute(() -> {
+                if (locationResponse != null) {
+                    try {
+                        // Parse JSON response to extract country and region
+                        String country = locationResponse.split("\"country\":\"")[1].split("\"")[0];
+                        String region = locationResponse.split("\"regionName\":\"")[1].split("\"")[0];
+
+                        add(theme.label("Server Location: " + country + ", " + region)).expandX();
+                    } catch (Exception e) {
+                        add(theme.label("Failed to fetch server location")).expandX();
+                    }
+                }
+            });
+        });
+    }
+
+    private void loadPlayers(ServerInfoResponse response) {
         List<ServerInfoResponse.Player> players = response.players();
+
         if (players.isEmpty()) {
             add(theme.label("No records of players found.")).expandX();
             return;
         }
-        /* "players": [ // An array of when which players were seen on the server. Limited to 1000
-            {
-              "last_seen": 1683790506, // The last time the player was seen on the server (unix timestamp)
-              "name": "DAMcraft", // The name of the player
-              "uuid": "68af4d98-24a2-41b6-96bc-a9c2ef9b397b" // The uuid of the player
-            }, ...
-          ] */
-        boolean cracked = false;
-        if (response.cracked() != null) {
-            cracked = response.cracked();
+
+        if (Boolean.FALSE.equals(response.cracked())) {
+            add(theme.label("Attention: The server is NOT cracked!")).expandX();
         }
 
-        if (!cracked) {
-            add(theme.label("Attention: The server is NOT cracked!")).expandX();
-            add(theme.label("")).expandX();
-        }
-        String playersLabel = players.size() == 1 ? " player:" : " players:";
-        add(theme.label("Found " + players.size() + playersLabel));
+        add(theme.label("Server Version: " + serverVersion)).expandX();
+        add(theme.label("Found " + players.size() + " players:"));
 
         WTable table = add(theme.table()).widget();
-
-        table.add(theme.label("Name "));
-        table.add(theme.label("Last seen "));
-        table.add(theme.label("Login (cracked)"));
-        table.row();
-
-        table.add(theme.horizontalSeparator()).expandX();
+        table.add(theme.label("Name"));
+        table.add(theme.label("Last seen"));
+        table.add(theme.label("UUID"));
+        table.add(theme.label("Actions"));
         table.row();
 
         for (ServerInfoResponse.Player player : players) {
-            String name = player.name();
-            long lastSeen = player.lastSeen();
-            String lastSeenFormatted = DateTimeFormatter.ofLocalizedDateTime(FormatStyle.SHORT)
-                .format(Instant.ofEpochSecond(lastSeen).atZone(ZoneId.systemDefault()).toLocalDateTime());
+            String lastSeenStr = DateTimeFormatter.ofLocalizedDateTime(FormatStyle.SHORT)
+                .format(Instant.ofEpochSecond(player.lastSeen()).atZone(ZoneId.systemDefault()).toLocalDateTime());
 
-            table.add(theme.label(name + " "));
-            table.add(theme.label(lastSeenFormatted + " "));
+            table.add(theme.label(player.name()));
+            table.add(theme.label(lastSeenStr));
+            table.add(theme.label(player.uuid()));
 
-            if (mc.getSession().getUsername().equals(name)) {
-                table.add(theme.label("Logged in")).expandCellX();
-            } else {
+            WButton loginBtn = theme.button("Login");
+            loginBtn.action = () -> {
+                loginCracked(player.name());
+                close();
+            };
 
-                WButton loginButton = table.add(theme.button("Login")).widget();
-                // Check if the user is currently logged in
-                if (mc.getSession().getUsername().equals(name)) {
-                    loginButton.visible = false;
-                }
+            WButton uuidBtn = theme.button("Copy UUID");
+            uuidBtn.action = () -> {
+                mc.keyboard.setClipboard(player.uuid());
+            };
 
-                // Log in the user
-                loginButton.action = () -> {
-                    loginButton.visible = false;
-                    if (this.client == null) return;
-                    // Check if the account already exists
-                    boolean exists = false;
-                    for (Account<?> account : Accounts.get()) {
-                        if (account instanceof CrackedAccount && account.getUsername().equals(name)) {
-                            account.login();
-                            exists = true;
-                            break;
-                        }
-                    }
-                    if (!exists) {
-                        CrackedAccount account = new CrackedAccount(name);
-                        account.login();
-                        Accounts.get().add(account);
-                    }
-                    close();
-                };
-            }
+            WButton profileBtn = theme.button("NameMC");
+            profileBtn.action = () -> {
+                Util.getOperatingSystem().open("https://namemc.com/profile/" + player.uuid());
+            };
+
+            table.add(theme.horizontalList(loginBtn, uuidBtn, profileBtn)).expandCellX();
             table.row();
         }
     }
-}
+
+    private void loginCracked(String name) {
+        for (Account<?> account : Accounts.get()) {
+            if (account instanceof CrackedAccount && account.getUsername().equals(name)) {
+                account.login();
+                return;
+            }
+        }
+        CrackedAccount account = new CrackedAccount(name);
+        account.login();
+        Accounts.get().add(account);
+    }
+                    }
