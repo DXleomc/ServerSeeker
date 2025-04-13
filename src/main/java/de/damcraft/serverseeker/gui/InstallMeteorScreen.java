@@ -19,114 +19,116 @@ import java.net.http.HttpResponse;
 import java.nio.file.*;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.logging.Logger;
 
 public class InstallMeteorScreen extends Screen {
+    private static final Logger LOGGER = Logger.getLogger("InstallMeteorScreen");
+    private String statusMessage = "";
+
     public InstallMeteorScreen() {
         super(Text.of("Meteor Client is not installed!"));
     }
 
-    public void render(DrawContext context, int mouseX, int mouseY, float delta) {
-        super.render(context, mouseX, mouseY, delta);
-        context.drawCenteredTextWithShadow(this.textRenderer, this.title, this.width / 2, this.height / 4 - 60 + 20, -1);
-    }
-
+    @Override
     protected void init() {
         super.init();
-        ButtonWidget quitButton = this.addDrawableChild(ButtonWidget.builder(Text.translatable("menu.quit"), (button) -> {
-            this.client.scheduleStop();
-        }).dimensions(this.width / 2 + 2, this.height / 4 + 100 + 25, 148, 20).build());
+        updateUI();
+    }
 
-        this.addDrawableChild(ButtonWidget.builder(Text.of("Automatically install Meteor (§arecommended§r)"), (button) -> {
-            quitButton.active = false;
+    private void updateUI() {
+        clearChildren();
+
+        addDrawableChild(ButtonWidget.builder(Text.of("Automatically install Meteor (§arecommended§r)"), (button) -> {
+            button.active = false;
+            statusMessage = "Downloading Meteor Client...";
+            updateUI();
+
             CompletableFuture.runAsync(() -> {
                 install();
-                quitButton.active = true;
+                button.active = true;
             });
-        }).dimensions(this.width / 2 - 150, this.height / 4 + 100, 300, 20).build());
+        }).dimensions(width / 2 - 150, height / 4 + 100, 300, 20).build());
 
-        this.addDrawableChild(ButtonWidget.builder(Text.of("Manual installation"), (button) -> {
-            Util.getOperatingSystem().open("https://meteorclient.com/faq/installation");
-        }).dimensions(this.width / 2 - 150, this.height / 4 + 100 + 25, 148, 20).build());
+        addDrawableChild(ButtonWidget.builder(Text.of("Manual installation"), (button) ->
+            Util.getOperatingSystem().open("https://meteorclient.com/faq/installation")
+        ).dimensions(width / 2 - 150, height / 4 + 130, 145, 20).build());
+
+        addDrawableChild(ButtonWidget.builder(Text.of("Open mods folder"), (button) -> {
+            Path modsFolder = FabricLoader.getInstance().getGameDir().resolve("mods");
+            Util.getOperatingSystem().open(modsFolder.toUri());
+        }).dimensions(width / 2 + 5, height / 4 + 130, 145, 20).build());
+
+        addDrawableChild(ButtonWidget.builder(Text.translatable("menu.quit"), (button) ->
+            this.client.scheduleStop()
+        ).dimensions(width / 2 - 75, height / 4 + 160, 150, 20).build());
+
+        if (!statusMessage.isEmpty()) {
+            addDrawableChild(new TextWidget(width / 2 - 140, height / 4 + 70, 280, 20, Text.of(statusMessage), textRenderer));
+        }
     }
 
     private void install() {
         String result = SmallHttp.get("https://meteorclient.com/api/stats");
         if (result == null) {
-            this.displayError("Failed to get install meteor automatically! Please install it manually.");
+            setStatus("Failed to fetch version info. Try manual installation.");
             return;
         }
 
-        Gson gson = new Gson();
-        JsonObject json = gson.fromJson(result, JsonObject.class);
+        JsonObject json = new Gson().fromJson(result, JsonObject.class);
         String currentVersion = SharedConstants.getGameVersion().getName();
         String stableVersion = json.get("mc_version").getAsString();
         String devBuildVersion = json.get("dev_build_mc_version").getAsString();
+
         String url;
         if (currentVersion.equals(stableVersion)) {
             url = "https://meteorclient.com/api/download";
         } else if (currentVersion.equals(devBuildVersion)) {
             url = "https://meteorclient.com/api/download?devBuild=latest";
         } else {
-            this.displayError("Failed to find Meteor for your current version. Please install it manually.");
+            setStatus("No compatible Meteor version found for your Minecraft version.");
             return;
         }
+
         HttpResponse<InputStream> file = SmallHttp.download(url);
         if (file == null) {
-            this.displayError("Failed to download Meteor! Please install it manually.");
+            setStatus("Failed to download Meteor Client.");
             return;
         }
-        Optional<String> filenameT = file.headers().firstValue("Content-Disposition");
-        String filename = "meteor-client.jar";
-        if (filenameT.isPresent()) {
-            String[] parts = filenameT.get().split("; ");
-            for (String part : parts) {
-                if (part.startsWith("filename=")) {
-                    filename = part.substring(9);
-                    break;
-                }
-            }
-            if (filename.startsWith("\"") && filename.endsWith("\"")) {
-                filename = filename.substring(1, filename.length() - 1);
-            }
-        }
 
-        // Get the mods folder
+        String filename = file.headers().firstValue("Content-Disposition")
+            .map(header -> header.replaceAll(".*filename=\"?([^\"]+)\"?", "$1"))
+            .orElse("meteor-client.jar");
+
         Path modsFolder = FabricLoader.getInstance().getGameDir().resolve("mods");
         if (!Files.exists(modsFolder)) {
-            this.displayError("Failed to find mods folder! Please install Meteor manually.");
+            setStatus("Mods folder not found.");
             return;
         }
 
-        // Save the file
+        Path filePath = modsFolder.resolve(filename);
+        if (Files.exists(filePath)) {
+            setStatus("Meteor Client already exists in mods folder.");
+            return;
+        }
+
         try {
-            Files.copy(file.body(), modsFolder.resolve(filename));
-        } catch (IOException | SecurityException | InvalidPathException e) {
-            this.displayError("Failed to save Meteor! Please install it manually.");
-            LogUtils.getLogger().error(e.toString());   // we can't import without causing errors (no meteor)
-            return;
+            Files.copy(file.body(), filePath);
+            setStatus("Meteor Client installed successfully. Please restart the game.");
+        } catch (IOException e) {
+            LOGGER.warning("Error saving Meteor jar: " + e);
+            setStatus("Failed to save Meteor Client. Check file permissions.");
         }
-
-        // Success message
-        this.displayNotice("Successfully installed Meteor! Please restart your game.");
     }
 
-    private void displayError(String errorMessage) {
-        this.displayNotice(errorMessage);
-
-        this.addDrawableChild(ButtonWidget.builder(Text.of("Open install FAQ"), (button2) -> {
-            Util.getOperatingSystem().open("https://meteorclient.com/faq/installation");
-        }).dimensions(this.width / 2 - 150, this.height / 4 + 100, 300, 20).build());
+    private void setStatus(String message) {
+        this.statusMessage = message;
+        LOGGER.info(message);
+        client.execute(this::updateUI);
     }
 
-    private void displayNotice(String noticeMessage) {
-        this.clearChildren();
-        this.addDrawableChild(new TextWidget(
-            this.width / 2 - 250,
-            this.height / 4,
-            500,
-            20,
-            Text.of(noticeMessage),
-            this.textRenderer
-        ));
+    @Override
+    public void render(DrawContext context, int mouseX, int mouseY, float delta) {
+        super.render(context, mouseX, mouseY, delta);
+        context.drawCenteredTextWithShadow(this.textRenderer, this.title, this.width / 2, this.height / 4 - 20, 0xFFFFFF);
     }
 }
