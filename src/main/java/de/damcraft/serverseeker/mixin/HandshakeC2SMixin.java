@@ -9,46 +9,89 @@ import net.minecraft.network.packet.c2s.handshake.ConnectionIntent;
 import net.minecraft.network.packet.c2s.handshake.HandshakeC2SPacket;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
-import org.spongepowered.asm.mixin.Mutable;
 import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
+import java.util.UUID;
+
+import static de.damcraft.serverseeker.ServerSeeker.LOG;
 import static de.damcraft.serverseeker.ServerSeeker.gson;
 import static meteordevelopment.meteorclient.MeteorClient.mc;
 
+/**
+ * Mixin for modifying handshake packets to bypass BungeeCord IP forwarding.
+ */
 @Mixin(HandshakeC2SPacket.class)
 public abstract class HandshakeC2SMixin {
+    @Shadow @Final @Mutable private String address;
+    @Shadow public abstract ConnectionIntent getIntent();
 
-    @Mutable
-    @Shadow
-    @Final
-    private String address;
+    @Unique private static final String MOJANG_API_URL = "https://api.mojang.com/users/profiles/minecraft/";
+    @Unique private static final String FORWARDING_FORMAT = "\u0000%s\u0000%s";
+    @Unique private static final int MAX_ADDRESS_LENGTH = 255;
 
-    @Shadow
-    public abstract ConnectionIntent intendedState();
+    @Inject(
+        method = "<init>(ILjava/lang/String;ILnet/minecraft/network/packet/c2s/handshake/ConnectionIntent;)V",
+        at = @At("RETURN")
+    private void onHandshakeConstructed(int protocolVersion, String address, int port, 
+                                      ConnectionIntent intent, CallbackInfo ci) {
+        // Only process if this is a login handshake
+        if (getIntent() != ConnectionIntent.LOGIN) return;
 
-    @Inject(method = "<init>(ILjava/lang/String;ILnet/minecraft/network/packet/c2s/handshake/ConnectionIntent;)V", at = @At("RETURN"))
-    private void onHandshakeC2SPacket(int i, String string, int j, ConnectionIntent connectionIntent, CallbackInfo ci) {
-        BungeeSpoofModule bungeeSpoofModule = Modules.get().get(BungeeSpoofModule.class);
-        if (!bungeeSpoofModule.isActive()) return;
-        if (this.intendedState() != ConnectionIntent.LOGIN) return;
-        ServerSeeker.LOG.info("Spoofing bungeecord handshake packet");
-        String spoofedUUID = mc.getSession().getUuidOrNull().toString();
+        BungeeSpoofModule module = Modules.get().get(BungeeSpoofModule.class);
+        if (!module.isActive() || !module.shouldSpoofCurrentServer()) return;
 
-        String URL = "https://api.mojang.com/users/profiles/minecraft/" + mc.getSession().getUsername();
+        try {
+            String spoofedAddress = module.getSpoofedAddress();
+            String playerUuid = getPlayerUuid(mc.getSession().getUsername());
 
-        Http.Request request = Http.get(URL);
-        String response = request.sendString();
-        if (response != null) {
-            JsonObject jsonObject = gson.fromJson(response, JsonObject.class);
+            String forwardedAddress = String.format(FORWARDING_FORMAT, spoofedAddress, playerUuid);
+            String newAddress = address + forwardedAddress;
 
-            if (jsonObject != null && jsonObject.has("id")) {
-                spoofedUUID = jsonObject.get("id").getAsString();
+            if (newAddress.length() > MAX_ADDRESS_LENGTH) {
+                LOG.warn("Spoofed address too long, truncating...");
+                newAddress = newAddress.substring(0, MAX_ADDRESS_LENGTH);
+            }
+
+            this.address = newAddress;
+            LOG.info("Spoofed BungeeCord handshake with address: {}", spoofedAddress);
+        } catch (Exception e) {
+            LOG.error("Failed to spoof BungeeCord handshake", e);
+            if (module.enableWarning.get()) {
+                module.warning("BungeeSpoof failed - connection not modified");
             }
         }
+    }
 
-        this.address += "\u0000" + bungeeSpoofModule.spoofedAddress.get() + "\u0000" + spoofedUUID;
+    /**
+     * Gets the player's UUID from Mojang API or falls back to local session UUID.
+     */
+    @Unique
+    private String getPlayerUuid(String username) {
+        // First try to get from local session
+        UUID localUuid = mc.getSession().getUuidOrNull();
+        if (localUuid != null) return localUuid.toString().replace("-", "");
+
+        // Fallback to Mojang API lookup
+        try {
+            String response = Http.get(MOJANG_API_URL + username)
+                .timeout(3000)
+                .sendString();
+
+            if (response != null) {
+                JsonObject json = gson.fromJson(response, JsonObject.class);
+                if (json != null && json.has("id")) {
+                    return json.get("id").getAsString();
+                }
+            }
+        } catch (Exception e) {
+            LOG.warn("Failed to fetch UUID from Mojang API", e);
+        }
+
+        // Fallback to offline mode UUID
+        return UUID.nameUUIDFromBytes(("OfflinePlayer:" + username).getBytes()).toString().replace("-", "");
     }
 }
