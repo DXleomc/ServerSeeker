@@ -62,6 +62,30 @@ public class FindPlayerScreen extends WindowScreen {
         .build()
     );
 
+    // Advanced Filters
+    private final Setting<String> region = sg.add(new StringSetting.Builder()
+        .name("region")
+        .description("Filter by server region (optional).")
+        .defaultValue("")
+        .build()
+    );
+
+    private final Setting<Integer> lastSeenMinDays = sg.add(new IntSetting.Builder()
+        .name("last-seen-min-days")
+        .description("Minimum days ago player was last seen (optional).")
+        .defaultValue(0)
+        .sliderMax(365)
+        .build()
+    );
+
+    private final Setting<Integer> lastSeenMaxDays = sg.add(new IntSetting.Builder()
+        .name("last-seen-max-days")
+        .description("Maximum days ago player was last seen (optional).")
+        .defaultValue(0)
+        .sliderMax(365)
+        .build()
+    );
+
     WContainer settingsContainer;
 
     public FindPlayerScreen(MultiplayerScreen multiplayerScreen) {
@@ -73,7 +97,6 @@ public class FindPlayerScreen extends WindowScreen {
     public void initWidgets() {
         WContainer settingsContainer = add(theme.verticalList()).widget();
         settingsContainer.add(theme.settings(settings)).expandX();
-
         this.settingsContainer = settingsContainer;
 
         add(theme.button("Find Player")).expandX().widget().action = () -> {
@@ -96,16 +119,33 @@ public class FindPlayerScreen extends WindowScreen {
                         return;
                     }
 
-                    // Set error message if there is one
                     if (response.isError()) {
                         add(theme.label(response.error)).expandX();
                         return;
                     }
-                    clear();
 
+                    clear();
                     List<WhereisResponse.Record> data = response.data;
+
+                    // Apply advanced filters
+                    long now = Instant.now().getEpochSecond();
+                    int minDays = lastSeenMinDays.get();
+                    int maxDays = lastSeenMaxDays.get();
+                    String regionFilter = region.get().toLowerCase();
+
+                    data.removeIf(server -> {
+                        boolean regionMismatch = !regionFilter.isEmpty()
+                            && (server.region == null || !server.region.toLowerCase().contains(regionFilter));
+
+                        long daysAgo = (now - server.last_seen) / 86400;
+                        boolean tooEarly = minDays > 0 && daysAgo < minDays;
+                        boolean tooLate = maxDays > 0 && daysAgo > maxDays;
+
+                        return regionMismatch || tooEarly || tooLate;
+                    });
+
                     if (data.isEmpty()) {
-                        add(theme.label("Not found")).expandX();
+                        add(theme.label("No servers matched the filters.")).expandX();
                         return;
                     }
 
@@ -125,20 +165,18 @@ public class FindPlayerScreen extends WindowScreen {
         table.add(theme.label("Server IP"));
         table.add(theme.label("Player name"));
         table.add(theme.label("Last seen"));
-
         table.row();
         table.add(theme.horizontalSeparator()).expandX();
         table.row();
 
-
         for (WhereisResponse.Record server : data) {
             String serverIP = server.server;
             String playerName = server.name;
-            long playerLastSeen = server.last_seen; // Unix timestamp
+            long playerLastSeen = server.last_seen;
 
-            // Format last seen to human-readable
             String playerLastSeenFormatted = DateTimeFormatter.ofLocalizedDate(FormatStyle.SHORT)
                 .format(Instant.ofEpochSecond(playerLastSeen).atZone(ZoneId.systemDefault()).toLocalDateTime());
+
             int minWidth = (int)(mc.getWindow().getWidth() * 0.2);
             table.add(theme.label(serverIP)).minWidth(minWidth);
             table.add(theme.label(playerName)).minWidth(minWidth);
@@ -175,8 +213,7 @@ public class FindPlayerScreen extends WindowScreen {
             MultiplayerScreenUtil.addInfoToServerList(multiplayerScreen, info, false);
         }
         MultiplayerScreenUtil.saveList(multiplayerScreen);
-        if (client == null) return;
-        client.setScreen(this.multiplayerScreen);
+        if (client != null) client.setScreen(this.multiplayerScreen);
     }
 
     @Override
